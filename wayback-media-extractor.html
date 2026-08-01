@@ -1,0 +1,340 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Wayback Media Extractor — Play archived videos</title>
+  <style>
+    body { font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial; margin: 0; padding: 16px; background:#fbfbff; color:#111; }
+    header { display:flex; gap:12px; align-items:end; flex-wrap:wrap; margin-bottom:12px; }
+    input[type="text"] { padding:8px; font-size:14px; width:520px; }
+    button { padding:8px 12px; font-size:14px; }
+    main { display:flex; gap:16px; align-items:flex-start; }
+    #left { width:420px; max-height:76vh; overflow:auto; border:1px solid #e6e6ee; padding:12px; background:#fff; }
+    .small { font-size:13px; color:#444; }
+    h3 { margin:0 0 8px 0; font-size:16px; }
+    ul { padding-left:16px; }
+    li.file { margin:8px 0; padding:8px; border:1px solid #eee; border-radius:6px; display:flex; justify-content:space-between; gap:8px; align-items:center; }
+    li.file .meta { flex:1; min-width:0; }
+    .url { word-break:break-all; font-size:12px; color:#666; }
+    #playerArea { flex:1; min-width:360px; }
+    video, audio { width:100%; height:360px; background:#000; }
+    .notice { background:#fff8e1; border:1px solid #ffe6a7; padding:8px; border-radius:6px; color:#6d4c00; margin-bottom:8px; }
+  </style>
+</head>
+<body>
+  <header>
+    <div>
+      <label class="small">Wayback (web.archive.org) page URL</label><br>
+      <input id="waybackUrl" type="text" placeholder="Paste a web.archive.org URL (e.g. https://web.archive.org/web/20220101123456/https://example.com/page)" />
+    </div>
+    <div style="display:flex; gap:8px; flex-direction:column;">
+      <button id="extractBtn">Extract media</button>
+      <button id="openReplayBtn">Open replay page</button>
+    </div>
+  </header>
+
+  <main>
+    <aside id="left">
+      <div id="status" class="small">Paste a Wayback replay URL and click "Extract media".</div>
+
+      <div id="resultsSection" style="margin-top:12px; display:none;">
+        <h3>Found media</h3>
+        <div id="foundCount" class="small"></div>
+        <ul id="filesList"></ul>
+      </div>
+
+      <div id="errors" style="margin-top:12px;"></div>
+    </aside>
+
+    <section id="playerArea">
+      <div id="playerInfo" class="small">No media selected</div>
+      <video id="videoPlayer" controls style="display:none;"></video>
+      <audio id="audioPlayer" controls style="display:none;"></audio>
+      <div id="rawLink" style="margin-top:8px;"></div>
+      <div id="debug" class="small" style="margin-top:12px; color:#666"></div>
+    </section>
+  </main>
+
+  <script>
+    // Utility: detect media extension
+    function isMediaUrl(url) {
+      return /\.(mp4|m4v|webm|ogv|mov|mkv|mp3|ogg|wav|aac|m4a|m2v|mpeg|mpg)(\?|$)/i.test(url);
+    }
+
+    // Extract identifier / timestamp from Wayback URL
+    function parseWaybackUrl(url) {
+      try {
+        const u = new URL(url);
+        if (!/web\.archive\.org$/.test(u.hostname) && !/web\.archive\.org$/.test(u.host)) return null;
+        const parts = u.pathname.split('/').filter(Boolean);
+        // patterns:
+        // /web/{timestamp}/{original}
+        // /web/*/{original}
+        // /web/{timestamp}if_/http... (some variants). We'll take the second part as timestamp when available.
+        if (parts.length >= 2 && parts[0] === 'web') {
+          const timestamp = parts[1]; // may be '*' or '2022...'
+          // reconstruct base '/web/{timestamp}/'
+          const base = u.origin + '/web/' + timestamp + '/';
+          // original url is remainder of path
+          const original = parts.slice(2).join('/');
+          const originalDecoded = original ? decodeURIComponent(original) : '';
+          return { timestamp, base, original: originalDecoded, full: u.href };
+        }
+        return { full: u.href };
+      } catch (e) {
+        return null;
+      }
+    }
+
+    // Resolve a possibly relative resource URL against the replay page URL
+    function resolveUrl(resourceUrl, baseUrl) {
+      try {
+        return new URL(resourceUrl, baseUrl).href;
+      } catch (e) {
+        return resourceUrl;
+      }
+    }
+
+    // If resource is not on web.archive.org and we have a timestamp, wrap it in web.archive.org/web/{ts}/{orig}
+    function toArchivedResourceUrl(resolvedUrl, parsedWayback) {
+      try {
+        const ru = new URL(resolvedUrl);
+        if (ru.hostname.endsWith('web.archive.org')) {
+          // already archived
+          return resolvedUrl;
+        }
+        // if parsedWayback has timestamp, use it
+        if (parsedWayback && parsedWayback.timestamp) {
+          // some timestamps are '*' — don't use those
+          if (parsedWayback.timestamp && parsedWayback.timestamp !== '*') {
+            return `https://web.archive.org/web/${parsedWayback.timestamp}/${resolvedUrl}`;
+          }
+        }
+        // fallback: try to use current replay full URL as base (often Wayback rewrites resources to relative /web/<ts>/... so resolvedUrl may already be web.archive)
+        return resolvedUrl;
+      } catch (e) {
+        return resolvedUrl;
+      }
+    }
+
+    // Fetch replay page HTML and parse it for media/resources
+    async function fetchAndExtract(waybackPageUrl) {
+      const status = document.getElementById('status');
+      const errors = document.getElementById('errors');
+      const filesList = document.getElementById('filesList');
+      const resultsSection = document.getElementById('resultsSection');
+      const foundCount = document.getElementById('foundCount');
+      const debug = document.getElementById('debug');
+
+      errors.innerHTML = '';
+      filesList.innerHTML = '';
+      resultsSection.style.display = 'none';
+      status.textContent = 'Fetching archived page HTML…';
+
+      const parsed = parseWaybackUrl(waybackPageUrl);
+      if (!parsed) {
+        errors.innerHTML = '<div class="notice">Invalid Wayback URL — must be a web.archive.org replay URL.</div>';
+        status.textContent = 'Error: invalid Wayback URL.';
+        return;
+      }
+
+      try {
+        const res = await fetch(waybackPageUrl, { credentials: 'omit' });
+        if (!res.ok) {
+          throw new Error('Fetch failed: ' + res.status + ' ' + res.statusText);
+        }
+        const text = await res.text();
+
+        // parse HTML
+        const parser = new DOMParser();
+        const doc = parser.parseFromString(text, 'text/html');
+
+        // Collect media candidates
+        const candidates = new Map();
+
+        // helper to add candidate
+        function addCandidate(rawUrl, context) {
+          if (!rawUrl) return;
+          const resolved = resolveUrl(rawUrl, waybackPageUrl);
+          const archived = toArchivedResourceUrl(resolved, parsed);
+          // only add once
+          if (!candidates.has(archived)) {
+            candidates.set(archived, { archived, resolved, raw: rawUrl, context });
+          }
+        }
+
+        // video tags and their sources
+        doc.querySelectorAll('video').forEach(v => {
+          if (v.src) addCandidate(v.src, 'video.src');
+          v.querySelectorAll('source').forEach(s => addCandidate(s.src || s.getAttribute('data-src') || s.getAttribute('src'), 'video>source'));
+        });
+
+        // audio tags
+        doc.querySelectorAll('audio').forEach(a => {
+          if (a.src) addCandidate(a.src, 'audio.src');
+          a.querySelectorAll('source').forEach(s => addCandidate(s.src || s.getAttribute('data-src') || s.getAttribute('src'), 'audio>source'));
+        });
+
+        // iframe embeds (may embed players or other hosts)
+        doc.querySelectorAll('iframe').forEach(i => {
+          const src = i.src || i.getAttribute('data-src') || i.getAttribute('src');
+          addCandidate(src, 'iframe');
+        });
+
+        // embed/object
+        doc.querySelectorAll('embed,object').forEach(el => {
+          const src = el.src || el.data || el.getAttribute('data') || el.getAttribute('src');
+          addCandidate(src, el.tagName.toLowerCase());
+        });
+
+        // anchor links to media files
+        doc.querySelectorAll('a').forEach(a => {
+          const href = a.href || a.getAttribute('href');
+          if (href && isMediaUrl(href)) addCandidate(href, 'a[href]');
+        });
+
+        // link tags (sometimes video/audio)
+        doc.querySelectorAll('link').forEach(l => {
+          const href = l.href || l.getAttribute('href');
+          if (href && isMediaUrl(href)) addCandidate(href, 'link[href]');
+        });
+
+        // Some Wayback replays include script blocks with direct URLs in JSON or JS — attempt a regex scan for common media extensions as fallback
+        const fallbackMatches = Array.from(text.matchAll(/https?:\/\/[^"'()\s<>]+?\.(mp4|m4v|webm|ogv|mov|mkv|mp3|ogg|wav|aac|m4a|m2v|mpeg|mpg)(\?[^"'()\s<>]*)?/gi));
+        fallbackMatches.forEach(m => addCandidate(m[0], 'inline-js'));
+
+        // Convert candidates to array and filter out non-media if not obviously media, but still include if from iframe to investigate
+        const list = Array.from(candidates.values()).map(c => {
+          const isMedia = isMediaUrl(c.archived) || isMediaUrl(c.resolved);
+          return { ...c, likelyMedia: isMedia };
+        });
+
+        // Sort: likely media first
+        list.sort((a,b) => (b.likelyMedia - a.likelyMedia));
+
+        // Display results
+        if (list.length === 0) {
+          resultsSection.style.display = 'none';
+          status.textContent = 'No media links detected in the archived page.';
+          errors.innerHTML = '<div class="small">Try a different snapshot or open the replay page directly and inspect manually. If fetch was blocked (CORS), use the "Open replay page" button or a proxy.</div>';
+          return;
+        }
+
+        resultsSection.style.display = '';
+        foundCount.textContent = `${list.length} candidate(s) found — media-like items listed first.`;
+        filesList.innerHTML = '';
+
+        list.forEach(item => {
+          const li = document.createElement('li');
+          li.className = 'file';
+          const meta = document.createElement('div');
+          meta.className = 'meta';
+          const title = document.createElement('div');
+          title.textContent = item.archived.split('/').pop() || item.archived;
+          const ctx = document.createElement('div');
+          ctx.className = 'small';
+          ctx.textContent = `source: ${item.context} — resolved:`;
+          const urlDiv = document.createElement('div');
+          urlDiv.className = 'url';
+          urlDiv.textContent = item.archived;
+
+          meta.appendChild(title);
+          meta.appendChild(ctx);
+          meta.appendChild(urlDiv);
+
+          const actions = document.createElement('div');
+          actions.style.display = 'flex';
+          actions.style.flexDirection = 'column';
+          actions.style.gap = '6px';
+
+          const openBtn = document.createElement('button');
+          openBtn.textContent = 'Open';
+          openBtn.onclick = () => window.open(item.archived, '_blank', 'noopener');
+
+          const playBtn = document.createElement('button');
+          playBtn.textContent = 'Play';
+          playBtn.onclick = () => {
+            playArchivedResource(item.archived);
+          };
+
+          actions.appendChild(playBtn);
+          actions.appendChild(openBtn);
+
+          li.appendChild(meta);
+          li.appendChild(actions);
+          filesList.appendChild(li);
+        });
+
+        status.textContent = 'Extraction complete.';
+        debug.textContent = `Parsed replay URL base: ${parsed.base || '(none)'}; timestamp: ${parsed.timestamp || '(none)'}; raw path: ${parsed.original || '(none)'}`;
+      } catch (err) {
+        console.error(err);
+        errors.innerHTML = '<div class="notice">Failed to fetch or parse the Wayback page. This is commonly caused by CORS or Wayback blocking cross-origin fetches. You can click "Open replay page" to open the snapshot in a new tab. For programmatic extraction, use a server-side proxy.</div><div class="small" style="margin-top:8px;">Error: ' + (err.message || err) + '</div>';
+        status.textContent = 'Error extracting page.';
+      }
+    }
+
+    // Play a resource URL — decide video or audio based on extension or Content-Type (we can't HEAD easily without CORS)
+    function playArchivedResource(url) {
+      const videoPlayer = document.getElementById('videoPlayer');
+      const audioPlayer = document.getElementById('audioPlayer');
+      const playerInfo = document.getElementById('playerInfo');
+      const rawLink = document.getElementById('rawLink');
+
+      // determine type by extension
+      const lower = url.split('?')[0].toLowerCase();
+      const isAudio = /\.(mp3|ogg|wav|aac|m4a)$/i.test(lower);
+      const isVideo = /\.(mp4|m4v|webm|ogv|mov|mkv|m2v|mpeg|mpg)$/i.test(lower);
+
+      // hide both
+      videoPlayer.style.display = 'none';
+      audioPlayer.style.display = 'none';
+      videoPlayer.pause();
+      audioPlayer.pause();
+      videoPlayer.removeAttribute('src');
+      audioPlayer.removeAttribute('src');
+
+      if (isVideo) {
+        videoPlayer.style.display = '';
+        videoPlayer.src = url;
+        videoPlayer.load();
+        videoPlayer.play().catch(()=>{ /* autoplay may be blocked */ });
+        playerInfo.textContent = 'Playing video: ' + url.split('/').pop();
+      } else if (isAudio) {
+        audioPlayer.style.display = '';
+        audioPlayer.src = url;
+        audioPlayer.load();
+        audioPlayer.play().catch(()=>{});
+        playerInfo.textContent = 'Playing audio: ' + url.split('/').pop();
+      } else {
+        // unknown — try to load in video first
+        videoPlayer.style.display = '';
+        videoPlayer.src = url;
+        videoPlayer.load();
+        playerInfo.textContent = 'Attempting playback: ' + url;
+        videoPlayer.play().catch(()=>{});
+      }
+
+      rawLink.innerHTML = `<div class="small">Direct resource: <a href="${url}" target="_blank" rel="noopener">${url}</a></div>`;
+    }
+
+    // Open replay page in a tab
+    document.getElementById('openReplayBtn').addEventListener('click', () => {
+      const u = document.getElementById('waybackUrl').value.trim();
+      if (!u) return alert('Paste a web.archive.org replay URL first.');
+      window.open(u, '_blank', 'noopener');
+    });
+
+    // Extract button
+    document.getElementById('extractBtn').addEventListener('click', () => {
+      const u = document.getElementById('waybackUrl').value.trim();
+      if (!u) return alert('Paste a web.archive.org replay URL first.');
+      fetchAndExtract(u);
+    });
+
+    // Helpful example
+    document.getElementById('waybackUrl').placeholder = 'e.g. https://web.archive.org/web/20220101123456/https://example.com/page or https://web.archive.org/web/*/https://example.com/page';
+  </script>
+</body>
+</html>
