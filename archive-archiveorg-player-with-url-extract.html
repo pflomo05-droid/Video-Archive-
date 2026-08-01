@@ -1,0 +1,355 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Archive.org TV Player — URL Extract</title>
+  <style>
+    body { font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial; margin: 0; padding: 16px; background:#fafafa; color:#111; }
+    header { display:flex; flex-wrap:wrap; gap:12px; align-items:end; margin-bottom:12px; }
+    input[type="text"], select { padding:8px; font-size:14px; width:320px; }
+    button { padding:8px 12px; font-size:14px; }
+    main { display:flex; gap:16px; align-items:flex-start; }
+    #results { width:360px; max-height:72vh; overflow:auto; border:1px solid #e0e0e0; padding:8px; background:#fff; }
+    .item { display:flex; gap:8px; padding:8px; border-bottom:1px solid #f0f0f0; cursor:pointer; align-items:center; }
+    .item:hover { background:#f7f7ff; }
+    .thumb { width:100px; height:56px; background:#ddd; object-fit:cover; }
+    .meta { font-size:13px; line-height:1.1; }
+    .title { font-weight:600; }
+    #player-wrapper { flex:1; min-width:320px; }
+    iframe { width:100%; height:360px; border:1px solid #ddd; background:#000; }
+    video { width:100%; height:360px; background:#000; }
+    .small { font-size:12px; color:#666; }
+    ul.file-list { list-style:none; padding:0; margin:8px 0 0 0; }
+    ul.file-list li { padding:6px 4px; border-bottom:1px dashed #eee; display:flex; justify-content:space-between; align-items:center; }
+    .play-link { color: #0366d6; cursor:pointer; text-decoration:underline; background:none; border:none; padding:0; font:inherit; }
+  </style>
+</head>
+<body>
+  <header>
+    <div>
+      <label class="small">Search Archive.org (query)</label><br/>
+      <input id="q" type="text" placeholder="e.g. 'USA web TV' or network/show name" />
+    </div>
+
+    <div>
+      <label class="small">Collection (optional)</label><br/>
+      <input id="collection" type="text" placeholder="e.g. TV-USA or tv" />
+    </div>
+
+    <div>
+      <label class="small">Archive.org page URL</label><br/>
+      <input id="pageUrl" type="text" placeholder="Paste an Archive.org item page URL here (https://archive.org/details/IDENTIFIER)" style="width:420px" />
+    </div>
+
+    <div style="display:flex; flex-direction:column; gap:6px;">
+      <div>
+        <button id="searchBtn">Search</button>
+        <button id="extractBtn">Extract from URL</button>
+      </div>
+      <div>
+        <button id="playEmbedBtn">Play item (embed)</button>
+        <label class="small" style="margin-left:8px">Autoplay<input id="autoplay" type="checkbox" checked style="margin-left:6px" /></label>
+      </div>
+    </div>
+  </header>
+
+  <main>
+    <aside id="results" aria-label="Search results">
+      <div class="small">Results will appear here. Click an item to play. Or extract from a page URL to list files.</div>
+      <div id="list"></div>
+
+      <div id="filesSection" style="margin-top:12px; display:none;">
+        <div class="small">Files found in item:</div>
+        <ul id="filesList" class="file-list"></ul>
+      </div>
+
+      <div id="identifiers" class="small" style="margin-top:8px;">
+        Or provide comma-separated identifiers to load specific items:<br/>
+        <input id="idsInput" type="text" placeholder="identifier1,identifier2" />
+        <button id="loadBtn">Load</button>
+      </div>
+    </aside>
+
+    <section id="player-wrapper">
+      <div style="display:flex; gap:8px; align-items:center; margin-bottom:8px;">
+        <div style="flex:1">
+          <div id="nowPlaying" class="title">No item selected</div>
+          <div id="nowMeta" class="small"></div>
+        </div>
+      </div>
+
+      <iframe id="embedPlayer" src="" allowfullscreen webkitallowfullscreen mozallowfullscreen sandbox="allow-scripts allow-forms allow-same-origin allow-popups"></iframe>
+
+      <video id="directPlayer" controls style="display:none;"></video>
+
+      <div style="margin-top:8px;" class="small">
+        Direct embed example for an item: &lt;iframe src="https://archive.org/embed/IDENTIFIER" ...&gt;&lt;/iframe&gt;<br/>
+        Direct file URL example: https://archive.org/download/IDENTIFIER/FILENAME
+      </div>
+    </section>
+  </main>
+
+  <script>
+    // Utility: build Archive.org advancedsearch url
+    function buildSearchUrl(q, collection, rows=40) {
+      let query = q ? q : '';
+      if (collection) {
+        query = (query ? "(" + query + ") AND " : "") + "collection:" + collection;
+      }
+      if (!query) query = "mediatype:movies OR mediatype:tv OR mediatype:audio";
+      const fields = [
+        "identifier",
+        "title",
+        "mediatype",
+        "subject",
+        "creator",
+        "description",
+        "publicdate",
+        "year",
+        "avg_rating",
+        "format"
+      ];
+      const params = new URLSearchParams({
+        q: query,
+        fl: fields.join(","),
+        rows: String(rows),
+        sort: "publicdate desc",
+        output: "json"
+      });
+      return "https://archive.org/advancedsearch.php?" + params.toString();
+    }
+
+    // Render search results
+    function renderResults(docs) {
+      const list = document.getElementById('list');
+      list.innerHTML = "";
+      if (!docs || docs.length === 0) {
+        list.innerHTML = '<div class="small">No results found.</div>';
+        return;
+      }
+      docs.forEach(doc => {
+        const id = doc.identifier;
+        const title = doc.title || id;
+        const mediatype = doc.mediatype || '';
+        const desc = (doc.description||'').slice(0,160);
+        const thumb = "https://archive.org/services/img/" + encodeURIComponent(id);
+
+        const el = document.createElement('div');
+        el.className = 'item';
+        el.tabIndex = 0;
+        el.innerHTML = `
+          <img class="thumb" src="${thumb}" alt="${title} thumbnail" onerror="this.src='https://archive.org/static/img/blank-200x200.png'"/>
+          <div class="meta"><div class="title">${escapeHtml(title)}</div><div class="small">${escapeHtml(mediatype)} — ${escapeHtml(doc.creator||'')}</div><div class="small">${escapeHtml(desc)}</div></div>
+        `;
+        el.addEventListener('click', () => playItem(id, title, doc));
+        el.addEventListener('keydown', (e)=> { if(e.key === 'Enter') playItem(id, title, doc); });
+        list.appendChild(el);
+      });
+    }
+
+    // Play by identifier using embed iframe
+    function playItem(identifier, title, doc) {
+      const player = document.getElementById('embedPlayer');
+      const directPlayer = document.getElementById('directPlayer');
+      directPlayer.style.display = 'none';
+      player.style.display = '';
+      const autoplay = document.getElementById('autoplay').checked ? 1 : 0;
+      const src = `https://archive.org/embed/${encodeURIComponent(identifier)}?autoplay=${autoplay}`;
+      player.src = src;
+      document.getElementById('nowPlaying').textContent = title || identifier;
+      document.getElementById('nowMeta').textContent = (doc && doc.publicdate ? doc.publicdate + " — " : "") + (doc && doc.mediatype ? doc.mediatype : "");
+    }
+
+    // Play a specific file (direct URL)
+    function playFile(identifier, file) {
+      const direct = document.getElementById('directPlayer');
+      const embed = document.getElementById('embedPlayer');
+      embed.style.display = 'none';
+      direct.style.display = '';
+      const fileUrl = `https://archive.org/download/${encodeURIComponent(identifier)}/${encodeURIComponent(file.name)}`;
+      // choose correct type if available
+      const t = (file.format || guessTypeFromName(file.name) || 'video/mp4');
+      direct.src = '';
+      direct.innerHTML = '';
+      const srcEl = document.createElement('source');
+      srcEl.src = fileUrl;
+      srcEl.type = t;
+      direct.appendChild(srcEl);
+      direct.load();
+      if (document.getElementById('autoplay').checked) {
+        direct.play().catch(()=>{/* ignore autoplay block */});
+      }
+      document.getElementById('nowPlaying').textContent = file.name;
+      document.getElementById('nowMeta').textContent = identifier + ' — ' + (file.format || '');
+    }
+
+    // Try to guess MIME type by file extension
+    function guessTypeFromName(name) {
+      const n = name.toLowerCase();
+      if (n.endsWith('.mp4') || n.endsWith('.m4v')) return 'video/mp4';
+      if (n.endsWith('.webm')) return 'video/webm';
+      if (n.endsWith('.ogv') || n.endsWith('.ogm')) return 'video/ogg';
+      if (n.endsWith('.mov')) return 'video/quicktime';
+      if (n.endsWith('.mkv')) return 'video/x-matroska';
+      if (n.endsWith('.mp3')) return 'audio/mpeg';
+      if (n.endsWith('.ogg')) return 'audio/ogg';
+      return '';
+    }
+
+    // Search handler
+    async function runSearch() {
+      const q = document.getElementById('q').value.trim();
+      const collection = document.getElementById('collection').value.trim();
+      const url = buildSearchUrl(q, collection, 50);
+      document.getElementById('list').innerHTML = '<div class="small">Searching…</div>';
+      try {
+        const res = await fetch(url);
+        const json = await res.json();
+        const docs = json.response && json.response.docs ? json.response.docs : [];
+        renderResults(docs);
+      } catch (err) {
+        console.error(err);
+        document.getElementById('list').innerHTML = '<div class="small">Search failed. See console for details.</div>';
+      }
+    }
+
+    // Extract identifier from a page URL
+    function extractIdentifierFromUrl(url) {
+      try {
+        const u = new URL(url);
+        // canonical path patterns:
+        // /details/IDENTIFIER
+        // /details/IDENTIFIER/slug
+        // /embed/IDENTIFIER
+        // also accept plain IDENTIFIER or trailing slash
+        const p = u.pathname;
+        let m;
+        m = p.match(/^\/details\/([^\/?#]+)/i);
+        if (m) return m[1];
+        m = p.match(/^\/embed\/([^\/?#]+)/i);
+        if (m) return m[1];
+        // sometimes pages use /stream/IDENTIFIER? or other; fallback: last path segment if host is archive.org
+        const segs = p.split('/').filter(Boolean);
+        if (segs.length > 0) return segs[segs.length-1];
+        return null;
+      } catch (e) {
+        return null;
+      }
+    }
+
+    // Fetch metadata via API and show files
+    async function extractMetadataAndShowFiles(identifier) {
+      if (!identifier) return;
+      document.getElementById('filesSection').style.display = '';
+      const filesList = document.getElementById('filesList');
+      filesList.innerHTML = '<li class="small">Fetching metadata…</li>';
+      try {
+        const metaUrl = `https://archive.org/metadata/${encodeURIComponent(identifier)}`;
+        const res = await fetch(metaUrl);
+        if (!res.ok) throw new Error('Metadata fetch failed: ' + res.status);
+        const json = await res.json();
+        const files = Array.isArray(json.files) ? json.files : [];
+        // filter likely video/audio files
+        const mediaFiles = files.filter(f => {
+          if (!f || !f.name) return false;
+          const name = f.name.toLowerCase();
+          // keep video extensions and some audio
+          const goodExt = ['.mp4', '.m4v', '.webm', '.ogv', '.mov', '.mkv', '.mp3', '.ogg', '.mpeg', '.m2v'];
+          for (const ext of goodExt) if (name.endsWith(ext)) return true;
+          // some files use format field
+          if (f.format && /mp4|mpeg|h\.264|h264|webm|matroska|ogg|mp3|audio/i.test(f.format)) return true;
+          return false;
+        });
+
+        if (mediaFiles.length === 0) {
+          filesList.innerHTML = '<li class="small">No obvious audio/video files found in metadata.</li>';
+          return;
+        }
+
+        filesList.innerHTML = '';
+        mediaFiles.forEach(f => {
+          const li = document.createElement('li');
+          const nameSpan = document.createElement('span');
+          nameSpan.textContent = f.name + (f.format ? ' — ' + f.format : '');
+          const btn = document.createElement('button');
+          btn.className = 'play-link';
+          btn.textContent = 'Play file';
+          btn.onclick = () => playFile(identifier, f);
+          const dl = document.createElement('a');
+          dl.href = `https://archive.org/download/${encodeURIComponent(identifier)}/${encodeURIComponent(f.name)}`;
+          dl.target = '_blank';
+          dl.rel = 'noopener';
+          dl.textContent = 'Open';
+          dl.style.marginLeft = '10px';
+          li.appendChild(nameSpan);
+          li.appendChild(btn);
+          li.appendChild(dl);
+          filesList.appendChild(li);
+        });
+      } catch (err) {
+        console.error(err);
+        filesList.innerHTML = '<li class="small">Failed to fetch metadata. See console for details.</li>';
+      }
+    }
+
+    // Handler for Extract button
+    document.getElementById('extractBtn').addEventListener('click', () => {
+      const url = document.getElementById('pageUrl').value.trim();
+      if (!url) {
+        alert('Please paste an Archive.org item page URL first.');
+        return;
+      }
+      const id = extractIdentifierFromUrl(url);
+      if (!id) {
+        alert('Could not extract identifier from URL. Make sure it is an archive.org/details/IDENTIFIER URL.');
+        return;
+      }
+      // set current identifier and attempt to play/embed
+      document.getElementById('nowPlaying').textContent = id;
+      // try to fetch some basic metadata via the advancedsearch doc for nicer title if available
+      // but main action is metadata files
+      extractMetadataAndShowFiles(id);
+      // set embed src but do not autoplay unless chosen
+      const autoplay = document.getElementById('autoplay').checked ? 1 : 0;
+      document.getElementById('embedPlayer').src = `https://archive.org/embed/${encodeURIComponent(id)}?autoplay=${autoplay}`;
+      window._currentIdentifier = id;
+    });
+
+    // Play embed button click
+    document.getElementById('playEmbedBtn').addEventListener('click', () => {
+      const id = window._currentIdentifier || (document.getElementById('idsInput').value.split(',')[0] || '').trim();
+      if (!id) { alert('No identifier found. Either search, click a result, or extract from a page URL.'); return; }
+      const autoplay = document.getElementById('autoplay').checked ? 1 : 0;
+      document.getElementById('embedPlayer').style.display = '';
+      document.getElementById('directPlayer').style.display = 'none';
+      document.getElementById('embedPlayer').src = `https://archive.org/embed/${encodeURIComponent(id)}?autoplay=${autoplay}`;
+      document.getElementById('nowPlaying').textContent = id;
+    });
+
+    // Load comma-separated identifiers directly (no API)
+    function loadIdentifiersFromInput() {
+      const val = document.getElementById('idsInput').value.trim();
+      if (!val) return;
+      const ids = val.split(',').map(s=>s.trim()).filter(Boolean);
+      const docs = ids.map(id => ({ identifier: id, title: id, mediatype: '' }));
+      renderResults(docs);
+      if (ids.length) {
+        playItem(ids[0], ids[0], {});
+        extractMetadataAndShowFiles(ids[0]);
+      }
+    }
+
+    // Small HTML escape
+    function escapeHtml(s) {
+      return String(s || '').replace(/[&<>\"']/g, (m) => ({'&':'&amp;','<':'&lt;','>':'&gt;','\"':'&quot;',"'":'&#39;'})[m]);
+    }
+
+    document.getElementById('searchBtn').addEventListener('click', runSearch);
+    document.getElementById('loadBtn').addEventListener('click', loadIdentifiersFromInput);
+    document.getElementById('q').addEventListener('keydown', (e)=> { if(e.key === 'Enter') runSearch(); });
+    // optional initial search:
+    document.getElementById('q').value = 'USA web TV';
+  </script>
+</body>
+</html>
